@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+"""Nautilus script: show APK version and install to device."""
+
+import io
+import os
+import struct
+import subprocess
+import tempfile
+import zipfile
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+import signal
+
+from gi.repository import Gtk, Adw, Gio
+from PIL import Image, ImageDraw
+
+VERSION_CODE_RID = 0x0101021B
+VERSION_NAME_RID = 0x0101021C
+ICON_RID = 0x01010002
+ICON_SIZE = 96
+ICON_RADIUS = 20
+
+
+# ── Binary XML / resources.arsc parsing ──────────────────────────────
+
+def _read_strings(data, pos):
+    count, _, flags, str_start, _ = struct.unpack_from('<5I', data, pos + 8)
+    utf8 = bool(flags & 0x100)
+    offsets = struct.unpack_from(f'<{count}I', data, pos + 28)
+    base = pos + str_start
+    result = []
+    for off in offsets:
+        p = base + off
+        if utf8:
+            if data[p] & 0x80:
+                p += 2
+            else:
+                p += 1
+            b = data[p]
+            if b & 0x80:
+                blen = ((b & 0x7F) << 8) | data[p + 1]
+                p += 2
+            else:
+                blen = b
+                p += 1
+            result.append(data[p:p + blen].decode('utf-8', errors='replace'))
+        else:
+            clen = struct.unpack_from('<H', data, p)[0]
+            p += 2
+            result.append(data[p:p + clen * 2].decode('utf-16-le', errors='replace'))
+    return result
+
+
+def _parse_manifest(data):
+    if len(data) < 8 or struct.unpack_from('<I', data, 0)[0] != 0x00080003:
+        return None, None, None, None
+    pos = 8
+    strings = []
+    res_ids = []
+    v_code = v_name = package = icon_ref = None
+
+    while pos < len(data) - 8:
+        ctype, hsize, csize = struct.unpack_from('<HHI', data, pos)
+        if csize < 8 or pos + csize > len(data):
+            break
+
+        if ctype == 0x0001:
+            strings = _read_strings(data, pos)
+        elif ctype == 0x0180:
+            n = (csize - hsize) // 4
+            res_ids = list(struct.unpack_from(f'<{n}I', data, pos + hsize))
+        elif ctype == 0x0102:
+            ext = pos + 16
+            if ext + 14 > len(data):
+                pos += csize
+                continue
+            _, el_name, a_start, a_size, a_count = struct.unpack_from(
+                '<IIHHH', data, ext
+            )
+            if a_size == 0:
+                a_size = 20
+            el_tag = strings[el_name] if el_name < len(strings) else ''
+            for i in range(a_count):
+                ap = ext + a_start + i * a_size
+                if ap + 20 > len(data):
+                    break
+                a_ns, a_nm, a_raw, tv_sz, tv_r, tv_t, tv_d = struct.unpack_from(
+                    '<IIIHBBI', data, ap
+                )
+                rid = res_ids[a_nm] if a_nm < len(res_ids) else None
+                if el_tag == 'manifest':
+                    if rid == VERSION_CODE_RID and tv_t in (0x10, 0x11):
+                        v_code = tv_d
+                    elif rid == VERSION_NAME_RID:
+                        if tv_t == 0x03 and 0 <= tv_d < len(strings):
+                            v_name = strings[tv_d]
+                        elif a_raw != 0xFFFFFFFF and a_raw < len(strings):
+                            v_name = strings[a_raw]
+                    elif a_ns == 0xFFFFFFFF and a_nm < len(strings) and strings[a_nm] == 'package':
+                        if tv_t == 0x03 and 0 <= tv_d < len(strings):
+                            package = strings[tv_d]
+                        elif a_raw != 0xFFFFFFFF and a_raw < len(strings):
+                            package = strings[a_raw]
+                elif el_tag == 'application':
+                    if rid == ICON_RID and tv_t == 0x01:
+                        icon_ref = tv_d
+
+        pos += csize
+    return v_code, v_name, package, icon_ref
+
+
+def _resolve_resource(arsc_data, res_id):
+    """Resolve resource ID via resources.arsc, return list of (density, filepath)."""
+    type_id = (res_id >> 16) & 0xFF
+    entry_id = res_id & 0xFFFF
+
+    if len(arsc_data) < 12:
+        return []
+    magic = struct.unpack_from('<H', arsc_data, 0)[0]
+    if magic != 0x0002:
+        return []
+
+    hsize = struct.unpack_from('<H', arsc_data, 2)[0]
+    pos = hsize
+    global_strings = []
+    results = []
+
+    while pos < len(arsc_data) - 8:
+        ct, _, cs = struct.unpack_from('<HHI', arsc_data, pos)
+        if cs < 8 or pos + cs > len(arsc_data):
+            break
+        if ct == 0x0001 and not global_strings:
+            global_strings = _read_strings(arsc_data, pos)
+        elif ct == 0x0200:
+            pkg_end = pos + cs
+            pkg_hsize = struct.unpack_from('<H', arsc_data, pos + 2)[0]
+            p = pos + pkg_hsize
+            while p < pkg_end - 8:
+                st, sh, ss = struct.unpack_from('<HHI', arsc_data, p)
+                if ss < 8 or p + ss > pkg_end:
+                    break
+                if st == 0x0201:
+                    tid = arsc_data[p + 8]
+                    if tid == type_id:
+                        entry_count = struct.unpack_from('<I', arsc_data, p + 12)[0]
+                        entries_start = struct.unpack_from('<I', arsc_data, p + 16)[0]
+                        density = 0
+                        if sh >= 36:
+                            density = struct.unpack_from('<H', arsc_data, p + 34)[0]
+                        if entry_id < entry_count:
+                            off = struct.unpack_from('<I', arsc_data, p + sh + entry_id * 4)[0]
+                            if off != 0xFFFFFFFF:
+                                ep = p + entries_start + off
+                                if ep + 16 <= len(arsc_data):
+                                    e_flags = struct.unpack_from('<H', arsc_data, ep + 2)[0]
+                                    if e_flags & 0x0001 == 0:
+                                        v_type = arsc_data[ep + 11]
+                                        v_data = struct.unpack_from('<I', arsc_data, ep + 12)[0]
+                                        if v_type == 0x03 and v_data < len(global_strings):
+                                            results.append((density, global_strings[v_data]))
+                p += ss
+        pos += cs
+    return results
+
+
+# ── Icon extraction ──────────────────────────────────────────────────
+
+def _process_icon(z, path):
+    """Extract icon, resize, apply rounded corners, return temp PNG path."""
+    raw = z.read(path)
+    img = Image.open(io.BytesIO(raw)).convert('RGBA')
+    img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
+    mask = Image.new('L', (ICON_SIZE, ICON_SIZE), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, ICON_SIZE, ICON_SIZE), radius=ICON_RADIUS, fill=255,
+    )
+    out = Image.new('RGBA', (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+    out.paste(img, mask=mask)
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    out.save(tmp, 'PNG')
+    tmp.close()
+    return tmp.name
+
+
+def extract_icon(apk_path, icon_ref):
+    """Extract app icon from APK, return temp file path or None."""
+    if icon_ref is None:
+        return None
+    try:
+        with zipfile.ZipFile(apk_path) as z:
+            names = set(z.namelist())
+            for density in ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi']:
+                for folder in [f'mipmap-{density}-v4', f'mipmap-{density}',
+                               f'drawable-{density}-v4', f'drawable-{density}']:
+                    for fname in ['ic_launcher.png', 'ic_launcher.webp']:
+                        path = f'res/{folder}/{fname}'
+                        if path in names:
+                            return _process_icon(z, path)
+            if 'resources.arsc' in names:
+                entries = _resolve_resource(z.read('resources.arsc'), icon_ref)
+                imgs = [(d, p) for d, p in entries
+                        if p in names and not p.endswith('.xml')]
+                if imgs:
+                    imgs.sort(key=lambda x: x[0], reverse=True)
+                    return _process_icon(z, imgs[0][1])
+    except Exception:
+        pass
+    return None
+
+
+# ── APK / device info ────────────────────────────────────────────────
+
+def get_apk_info(path):
+    try:
+        with zipfile.ZipFile(path) as z:
+            return _parse_manifest(z.read('AndroidManifest.xml'))
+    except Exception:
+        return None, None, None, None
+
+
+def get_installed_version(serial, package):
+    try:
+        r = subprocess.run(
+            ['adb', '-s', serial, 'shell', 'dumpsys', 'package', package],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, None
+    inst_code = inst_name = None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('versionCode=') and inst_code is None:
+            try:
+                inst_code = int(line.split('=', 1)[1].split()[0])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith('versionName=') and inst_name is None:
+            inst_name = line.split('=', 1)[1].strip()
+    return inst_code, inst_name
+
+
+def get_devices():
+    try:
+        r = subprocess.run(
+            ['adb', 'devices', '-l'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    devices = []
+    for line in r.stdout.strip().splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == 'device':
+            serial = parts[0]
+            model = ''
+            for p in parts[2:]:
+                if p.startswith('model:'):
+                    model = p.split(':', 1)[1]
+            devices.append((serial, model))
+    return devices
+
+
+def pick_device(devices):
+    if len(devices) == 1:
+        return devices[0][0]
+    items = []
+    for serial, model in devices:
+        label = f'{model} ({serial})' if model else serial
+        items.extend([serial, label])
+    r = subprocess.run(
+        ['zenity', '--list',
+         '--title=Select device',
+         '--text=Multiple devices connected:',
+         '--column=Serial', '--column=Device',
+         '--hide-column=1', '--print-column=1',
+         '--width=400', '--height=300'] + items,
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
+def adb_install(apk_path, serial):
+    apk_name = os.path.basename(apk_path)
+    size_mb = f'{os.path.getsize(apk_path) / 1024 / 1024:.1f} MB'
+
+    adb_proc = subprocess.Popen(
+        ['adb', '-s', serial, 'install', '-r', '-d', apk_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    progress = subprocess.Popen(
+        ['zenity', '--progress', '--pulsate', '--auto-close', '--no-cancel',
+         '--title=Installing...',
+         f'--text=Installing <b>{apk_name}</b> ({size_mb})...',
+         '--width=400'],
+        stdin=subprocess.PIPE,
+    )
+    stdout, stderr = adb_proc.communicate(timeout=120)
+    progress.stdin.close()
+    progress.wait()
+
+    output = (stdout.decode() + stderr.decode()).strip()
+    return adb_proc.returncode == 0 and 'Success' in output, output
+
+
+# ── GTK4 / Adwaita UI ───────────────────────────────────────────────
+
+def _version_text(label, v_name, v_code):
+    parts = []
+    if v_name:
+        parts.append(v_name)
+    if v_code is not None:
+        parts.append(f'(build {v_code})')
+    return f'{label}:  {" ".join(parts)}' if parts else None
+
+
+def _compare_markup(apk_code, inst_code):
+    if apk_code is None or inst_code is None:
+        return ''
+    if apk_code > inst_code:
+        return '<span foreground="#2ec27e"><b>UPGRADE</b></span>'
+    elif apk_code < inst_code:
+        return '<span foreground="#e5a50a"><b>DOWNGRADE</b></span>'
+    return '<span foreground="#9a9996">SAME VERSION</span>'
+
+
+def _make_label(markup, css_classes=None, halign=Gtk.Align.CENTER):
+    lbl = Gtk.Label()
+    lbl.set_markup(markup)
+    lbl.set_halign(halign)
+    for cls in (css_classes or []):
+        lbl.add_css_class(cls)
+    return lbl
+
+
+def show_main_dialog(icon_path, apk_name, apk_ver, apk_code,
+                     inst_ver, inst_code, package, device_label, can_install):
+    """Show main APK info dialog. Returns True if user chose Install."""
+    Adw.init()
+    chosen = [False]
+
+    def on_activate(app):
+        win = Adw.ApplicationWindow(application=app)
+        win.set_title('APK Version')
+        win.set_default_size(400, -1)
+        win.set_resizable(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_margin_top(24)
+        content.set_margin_bottom(24)
+        content.set_margin_start(32)
+        content.set_margin_end(32)
+
+        # Icon
+        if icon_path and os.path.isfile(icon_path):
+            pic = Gtk.Image.new_from_file(icon_path)
+            pic.set_pixel_size(ICON_SIZE)
+            pic.set_halign(Gtk.Align.CENTER)
+            content.append(pic)
+
+        # APK name
+        content.append(_make_label(f'<b>{apk_name}</b>', ['title-3']))
+
+        # Package
+        if package:
+            content.append(_make_label(
+                f'<span foreground="#9a9996">{package}</span>', ['caption'],
+            ))
+
+        # Version info
+        ver_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ver_box.set_halign(Gtk.Align.CENTER)
+        ver_box.set_margin_top(8)
+
+        apk_line = _version_text('APK', apk_ver, apk_code)
+        if apk_line:
+            ver_box.append(_make_label(apk_line))
+
+        if inst_ver is not None or inst_code is not None:
+            dev_line = _version_text('Device', inst_ver, inst_code)
+            if dev_line:
+                ver_box.append(_make_label(dev_line))
+            cmp = _compare_markup(apk_code, inst_code)
+            if cmp:
+                ver_box.append(_make_label(cmp))
+        elif can_install and package:
+            ver_box.append(_make_label(
+                '<span foreground="#9a9996">Not installed on device</span>'
+            ))
+
+        content.append(ver_box)
+
+        # Device info
+        if device_label:
+            content.append(Gtk.Separator())
+            content.append(_make_label(f'Device: <b>{device_label}</b>'))
+        elif can_install is False:
+            content.append(Gtk.Separator())
+            content.append(_make_label(
+                '<span foreground="#c01c28">No devices connected</span>'
+            ))
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
+                          homogeneous=True)
+        btn_box.set_margin_top(8)
+
+        close_btn = Gtk.Button(label='Close')
+        close_btn.connect('clicked', lambda _: win.close())
+        btn_box.append(close_btn)
+
+        if can_install:
+            install_btn = Gtk.Button(label='Install')
+            install_btn.add_css_class('suggested-action')
+            install_btn.connect('clicked', lambda _: _on_install(win))
+            btn_box.append(install_btn)
+
+        content.append(btn_box)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        toolbar.set_content(content)
+        win.set_content(toolbar)
+        win.present()
+
+    def _on_install(win):
+        chosen[0] = True
+        win.close()
+
+    app = Adw.Application(application_id='com.apkinfo.nautilus',
+                          flags=Gio.ApplicationFlags.NON_UNIQUE)
+    app.connect('activate', on_activate)
+    app.run([])
+    return chosen[0]
+
+
+def show_result_dialog(icon_path, success, output):
+    """Show install result dialog."""
+    Adw.init()
+
+    def on_activate(app):
+        win = Adw.ApplicationWindow(application=app)
+        win.set_title('ADB Install')
+        win.set_default_size(400, -1)
+        win.set_resizable(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(24)
+        content.set_margin_bottom(24)
+        content.set_margin_start(32)
+        content.set_margin_end(32)
+
+        if icon_path and os.path.isfile(icon_path):
+            pic = Gtk.Image.new_from_file(icon_path)
+            pic.set_pixel_size(ICON_SIZE)
+            pic.set_halign(Gtk.Align.CENTER)
+            content.append(pic)
+
+        if success:
+            content.append(_make_label(
+                '<span foreground="#2ec27e"><b>Installed successfully</b></span>',
+                ['title-3'],
+            ))
+        else:
+            content.append(_make_label(
+                '<span foreground="#c01c28"><b>Installation failed</b></span>',
+                ['title-3'],
+            ))
+
+        if output:
+            content.append(_make_label(
+                f'<span foreground="#9a9996">{output}</span>', ['caption'],
+            ))
+
+        ok_btn = Gtk.Button(label='OK')
+        ok_btn.set_margin_top(8)
+        ok_btn.connect('clicked', lambda _: win.close())
+        content.append(ok_btn)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        toolbar.set_content(content)
+        win.set_content(toolbar)
+        win.present()
+
+    app = Adw.Application(application_id='com.apkinfo.result',
+                          flags=Gio.ApplicationFlags.NON_UNIQUE)
+    app.connect('activate', on_activate)
+    app.run([])
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def _kill_previous():
+    pid = os.getpid()
+    try:
+        r = subprocess.run(
+            ['pgrep', '-f', 'nautilus/scripts/APK Version'],
+            capture_output=True, text=True,
+        )
+        for line in r.stdout.strip().splitlines():
+            other = int(line.strip())
+            if other != pid:
+                os.kill(other, signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def main():
+    _kill_previous()
+
+    paths = os.environ.get('NAUTILUS_SCRIPT_SELECTED_FILE_PATHS', '')
+    files = [p for p in paths.strip().splitlines() if p.lower().endswith('.apk')]
+
+    if not files:
+        subprocess.run(['zenity', '--warning', '--text=No APK files selected'])
+        return
+
+    devices = get_devices()
+    serial = devices[0][0] if devices else None
+    icon_path = None
+
+    # Single file — full dialog with icon and install
+    if len(files) == 1:
+        f = files[0]
+        code, name, package, icon_ref = get_apk_info(f)
+        icon_path = extract_icon(f, icon_ref)
+
+        inst_code = inst_name = None
+        if serial and package:
+            inst_code, inst_name = get_installed_version(serial, package)
+
+        dev_label = None
+        if devices:
+            s, m = devices[0]
+            dev_label = f'{m} ({s})' if m else s
+            if len(devices) > 1:
+                dev_label = f'{len(devices)} devices connected'
+
+        try:
+            want_install = show_main_dialog(
+                icon_path=icon_path,
+                apk_name=os.path.basename(f),
+                apk_ver=name, apk_code=code,
+                inst_ver=inst_name, inst_code=inst_code,
+                package=package,
+                device_label=dev_label,
+                can_install=bool(devices),
+            )
+            if want_install:
+                devices = get_devices()
+                if not devices:
+                    show_result_dialog(icon_path, False, 'No devices connected')
+                    return
+                sel = pick_device(devices)
+                if not sel:
+                    return
+                ok, output = adb_install(f, sel)
+                show_result_dialog(icon_path, ok, output)
+        finally:
+            if icon_path:
+                try:
+                    os.unlink(icon_path)
+                except OSError:
+                    pass
+    else:
+        # Multiple files — simple info list
+        lines = []
+        for f in files:
+            code, name, package, _ = get_apk_info(f)
+            nm = os.path.basename(f)
+            if code is not None or name is not None:
+                parts = []
+                if name:
+                    parts.append(name)
+                if code is not None:
+                    parts.append(f'(build {code})')
+                lines.append(f'<b>{nm}</b>\n  {" ".join(parts)}')
+            else:
+                lines.append(f'<b>{nm}</b>\n  failed to read version')
+        subprocess.run([
+            'zenity', '--info', '--title=APK Version',
+            '--text=' + '\n\n'.join(lines), '--width=400',
+        ])
+
+
+if __name__ == '__main__':
+    main()
