@@ -22,7 +22,9 @@ A lightweight Nautilus script that turns GNOME Files into an Android developer's
 
 ## Screenshots
 
-<!-- TODO: add screenshot -->
+| Info | Loading | Install result |
+|------|---------|----------------|
+| ![Info](screenshots/info.png) | ![Loading](screenshots/loading.png) | ![Result](screenshots/result.png) |
 
 ## Install
 
