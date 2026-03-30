@@ -6,6 +6,7 @@ import os
 import struct
 import subprocess
 import tempfile
+import threading
 import zipfile
 
 import gi
@@ -13,8 +14,7 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 import signal
 
-from gi.repository import Gtk, Adw, Gio
-from PIL import Image, ImageDraw
+from gi.repository import Gtk, Adw, Gio, GLib
 
 VERSION_CODE_RID = 0x0101021B
 VERSION_NAME_RID = 0x0101021C
@@ -169,6 +169,7 @@ def _resolve_resource(arsc_data, res_id):
 
 def _process_icon(z, path):
     """Extract icon, resize, apply rounded corners, return temp PNG path."""
+    from PIL import Image, ImageDraw
     raw = z.read(path)
     img = Image.open(io.BytesIO(raw)).convert('RGBA')
     img = img.resize((ICON_SIZE, ICON_SIZE), Image.LANCZOS)
@@ -336,15 +337,18 @@ def _make_label(markup, css_classes=None, halign=Gtk.Align.CENTER):
     return lbl
 
 
-def show_main_dialog(icon_path, apk_name, apk_ver, apk_code,
-                     inst_ver, inst_code, package, device_label, can_install):
-    """Show main APK info dialog. Returns True if user chose Install."""
+def show_main_dialog(apk_path):
+    """Show window with skeleton, progressively load APK info.
+
+    Returns (install_chosen, icon_path).
+    """
     Adw.init()
     chosen = [False]
+    icon_path_ref = [None]
 
     def on_activate(app):
         win = Adw.ApplicationWindow(application=app)
-        win.set_title('APK Version')
+        win.set_title('APK Dash')
         win.set_default_size(400, -1)
         win.set_resizable(False)
 
@@ -354,70 +358,38 @@ def show_main_dialog(icon_path, apk_name, apk_ver, apk_code,
         content.set_margin_start(32)
         content.set_margin_end(32)
 
-        # Icon
-        if icon_path and os.path.isfile(icon_path):
-            pic = Gtk.Image.new_from_file(icon_path)
-            pic.set_pixel_size(ICON_SIZE)
-            pic.set_halign(Gtk.Align.CENTER)
-            content.append(pic)
+        # Icon area — spinner placeholder
+        icon_box = Gtk.Box(halign=Gtk.Align.CENTER)
+        icon_box.set_size_request(ICON_SIZE, ICON_SIZE)
+        icon_spinner = Gtk.Spinner(halign=Gtk.Align.CENTER,
+                                   valign=Gtk.Align.CENTER)
+        icon_spinner.set_size_request(32, 32)
+        icon_spinner.start()
+        icon_box.append(icon_spinner)
+        content.append(icon_box)
 
-        # APK name
-        content.append(_make_label(f'<b>{apk_name}</b>', ['title-3']))
+        # APK name — available immediately
+        content.append(_make_label(
+            f'<b>{os.path.basename(apk_path)}</b>', ['title-3'],
+        ))
 
-        # Package
-        if package:
-            content.append(_make_label(
-                f'<span foreground="#9a9996">{package}</span>', ['caption'],
-            ))
+        # Info area — spinner until APK parsed
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                           halign=Gtk.Align.CENTER)
+        info_box.set_margin_top(8)
+        info_spinner = Gtk.Spinner(halign=Gtk.Align.CENTER)
+        info_spinner.set_size_request(24, 24)
+        info_spinner.start()
+        info_box.append(info_spinner)
+        content.append(info_box)
 
-        # Version info
-        ver_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        ver_box.set_halign(Gtk.Align.CENTER)
-        ver_box.set_margin_top(8)
-
-        apk_line = _version_text('APK', apk_ver, apk_code)
-        if apk_line:
-            ver_box.append(_make_label(apk_line))
-
-        if inst_ver is not None or inst_code is not None:
-            dev_line = _version_text('Device', inst_ver, inst_code)
-            if dev_line:
-                ver_box.append(_make_label(dev_line))
-            cmp = _compare_markup(apk_code, inst_code)
-            if cmp:
-                ver_box.append(_make_label(cmp))
-        elif can_install and package:
-            ver_box.append(_make_label(
-                '<span foreground="#9a9996">Not installed on device</span>'
-            ))
-
-        content.append(ver_box)
-
-        # Device info
-        if device_label:
-            content.append(Gtk.Separator())
-            content.append(_make_label(f'Device: <b>{device_label}</b>'))
-        elif can_install is False:
-            content.append(Gtk.Separator())
-            content.append(_make_label(
-                '<span foreground="#c01c28">No devices connected</span>'
-            ))
-
-        # Buttons
+        # Buttons — Close always visible, Install added after load
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
                           homogeneous=True)
         btn_box.set_margin_top(8)
-
         close_btn = Gtk.Button(label='Close')
         close_btn.connect('clicked', lambda _: win.close())
         btn_box.append(close_btn)
-
-        if can_install:
-            install_btn = Gtk.Button(label='Install')
-            install_btn.add_css_class('suggested-action')
-            install_btn.connect('clicked', lambda _: _on_install(win))
-            btn_box.append(install_btn)
-
         content.append(btn_box)
 
         toolbar = Adw.ToolbarView()
@@ -426,15 +398,102 @@ def show_main_dialog(icon_path, apk_name, apk_ver, apk_code,
         win.set_content(toolbar)
         win.present()
 
+        # -- Background loading in phases --
+        def gather():
+            # Phase 1: parse manifest
+            code, name, package, icon_ref = get_apk_info(apk_path)
+            GLib.idle_add(_show_apk_info, info_box, info_spinner,
+                          name, code, package)
+
+            # Phase 2: extract icon
+            icon_path = extract_icon(apk_path, icon_ref)
+            icon_path_ref[0] = icon_path
+            GLib.idle_add(_show_icon, icon_box, icon_path)
+
+            # Phase 3: query device via ADB
+            devs = get_devices()
+            serial = devs[0][0] if devs else None
+            inst_code = inst_name = None
+            if serial and package:
+                inst_code, inst_name = get_installed_version(serial, package)
+
+            dev_label = None
+            if devs:
+                s, m = devs[0]
+                dev_label = f'{m} ({s})' if m else s
+                if len(devs) > 1:
+                    dev_label = f'{len(devs)} devices connected'
+
+            GLib.idle_add(_show_device_info, info_box, btn_box, win,
+                          code, inst_code, inst_name,
+                          package, dev_label, bool(devs))
+
+        threading.Thread(target=gather, daemon=True).start()
+
     def _on_install(win):
         chosen[0] = True
         win.close()
 
-    app = Adw.Application(application_id='com.apkinfo.nautilus',
+    def _show_icon(icon_box, icon_path):
+        child = icon_box.get_first_child()
+        if child:
+            icon_box.remove(child)
+        if icon_path and os.path.isfile(icon_path):
+            pic = Gtk.Image.new_from_file(icon_path)
+            pic.set_pixel_size(ICON_SIZE)
+            pic.set_halign(Gtk.Align.CENTER)
+            icon_box.append(pic)
+        else:
+            icon_box.set_visible(False)
+        return False
+
+    def _show_apk_info(info_box, spinner, name, code, package):
+        info_box.remove(spinner)
+        if package:
+            info_box.append(_make_label(
+                f'<span foreground="#9a9996">{package}</span>', ['caption'],
+            ))
+        apk_line = _version_text('APK', name, code)
+        if apk_line:
+            info_box.append(_make_label(apk_line))
+        return False
+
+    def _show_device_info(info_box, btn_box, win,
+                          apk_code, inst_code, inst_name,
+                          package, dev_label, can_install):
+        if inst_name is not None or inst_code is not None:
+            dev_line = _version_text('Device', inst_name, inst_code)
+            if dev_line:
+                info_box.append(_make_label(dev_line))
+            cmp = _compare_markup(apk_code, inst_code)
+            if cmp:
+                info_box.append(_make_label(cmp))
+        elif can_install and package:
+            info_box.append(_make_label(
+                '<span foreground="#9a9996">Not installed on device</span>'
+            ))
+
+        if dev_label:
+            info_box.append(Gtk.Separator())
+            info_box.append(_make_label(f'Device: <b>{dev_label}</b>'))
+        elif not can_install:
+            info_box.append(Gtk.Separator())
+            info_box.append(_make_label(
+                '<span foreground="#c01c28">No devices connected</span>'
+            ))
+
+        if can_install:
+            install_btn = Gtk.Button(label='Install')
+            install_btn.add_css_class('suggested-action')
+            install_btn.connect('clicked', lambda _: _on_install(win))
+            btn_box.append(install_btn)
+        return False
+
+    app = Adw.Application(application_id='com.PavelKhabusov.apkDash',
                           flags=Gio.ApplicationFlags.NON_UNIQUE)
     app.connect('activate', on_activate)
     app.run([])
-    return chosen[0]
+    return chosen[0], icon_path_ref[0]
 
 
 def show_result_dialog(icon_path, success, output):
@@ -443,7 +502,7 @@ def show_result_dialog(icon_path, success, output):
 
     def on_activate(app):
         win = Adw.ApplicationWindow(application=app)
-        win.set_title('ADB Install')
+        win.set_title('APK Dash')
         win.set_default_size(400, -1)
         win.set_resizable(False)
 
@@ -486,7 +545,7 @@ def show_result_dialog(icon_path, success, output):
         win.set_content(toolbar)
         win.present()
 
-    app = Adw.Application(application_id='com.apkinfo.result',
+    app = Adw.Application(application_id='com.PavelKhabusov.apkDash.result',
                           flags=Gio.ApplicationFlags.NON_UNIQUE)
     app.connect('activate', on_activate)
     app.run([])
@@ -498,7 +557,7 @@ def _kill_previous():
     pid = os.getpid()
     try:
         r = subprocess.run(
-            ['pgrep', '-f', 'nautilus/scripts/APK Version'],
+            ['pgrep', '-f', 'nautilus/scripts/APK Dash'],
             capture_output=True, text=True,
         )
         for line in r.stdout.strip().splitlines():
@@ -519,37 +578,11 @@ def main():
         subprocess.run(['zenity', '--warning', '--text=No APK files selected'])
         return
 
-    devices = get_devices()
-    serial = devices[0][0] if devices else None
-    icon_path = None
-
     # Single file — full dialog with icon and install
     if len(files) == 1:
         f = files[0]
-        code, name, package, icon_ref = get_apk_info(f)
-        icon_path = extract_icon(f, icon_ref)
-
-        inst_code = inst_name = None
-        if serial and package:
-            inst_code, inst_name = get_installed_version(serial, package)
-
-        dev_label = None
-        if devices:
-            s, m = devices[0]
-            dev_label = f'{m} ({s})' if m else s
-            if len(devices) > 1:
-                dev_label = f'{len(devices)} devices connected'
-
+        want_install, icon_path = show_main_dialog(f)
         try:
-            want_install = show_main_dialog(
-                icon_path=icon_path,
-                apk_name=os.path.basename(f),
-                apk_ver=name, apk_code=code,
-                inst_ver=inst_name, inst_code=inst_code,
-                package=package,
-                device_label=dev_label,
-                can_install=bool(devices),
-            )
             if want_install:
                 devices = get_devices()
                 if not devices:
@@ -570,7 +603,7 @@ def main():
         # Multiple files — simple info list
         lines = []
         for f in files:
-            code, name, package, _ = get_apk_info(f)
+            code, name, _, _ = get_apk_info(f)
             nm = os.path.basename(f)
             if code is not None or name is not None:
                 parts = []
@@ -582,7 +615,7 @@ def main():
             else:
                 lines.append(f'<b>{nm}</b>\n  failed to read version')
         subprocess.run([
-            'zenity', '--info', '--title=APK Version',
+            'zenity', '--info', '--title=APK Dash',
             '--text=' + '\n\n'.join(lines), '--width=400',
         ])
 
