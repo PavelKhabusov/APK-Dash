@@ -545,6 +545,9 @@ def show_result_dialog(icon_path, success, output):
         win.set_content(toolbar)
         win.present()
 
+        if success:
+            GLib.timeout_add_seconds(3, win.close)
+
     app = Adw.Application(application_id='com.PavelKhabusov.apkDash.result',
                           flags=Gio.ApplicationFlags.NON_UNIQUE)
     app.connect('activate', on_activate)
