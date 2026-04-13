@@ -3,6 +3,7 @@
 
 import io
 import os
+import sys
 import struct
 import subprocess
 import tempfile
@@ -478,9 +479,49 @@ def show_main_dialog(apk_path):
             info_box.append(_make_label(f'Device: <b>{dev_label}</b>'))
         elif not can_install:
             info_box.append(Gtk.Separator())
-            info_box.append(_make_label(
+            no_dev_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                                 spacing=8, halign=Gtk.Align.CENTER)
+            no_dev_box.append(_make_label(
                 '<span foreground="#c01c28">No devices connected</span>'
             ))
+            refresh_btn = Gtk.Button(icon_name='view-refresh-symbolic',
+                                     tooltip_text='Retry device search')
+            refresh_btn.add_css_class('flat')
+            def _refresh_devices(_):
+                # Remove old device info
+                children = []
+                child = info_box.get_first_child()
+                while child:
+                    nxt = child.get_next_sibling()
+                    if isinstance(child, (Gtk.Separator, Gtk.Box)):
+                        children.append(child)
+                    elif isinstance(child, Gtk.Label):
+                        markup = child.get_label() or ''
+                        if 'Device' in markup or 'No devices' in markup or 'connected' in markup:
+                            children.append(child)
+                    child = nxt
+                for c in children:
+                    info_box.remove(c)
+                # Remove install button if exists
+                while btn_box.get_last_child() and btn_box.get_last_child() != btn_box.get_first_child():
+                    btn_box.remove(btn_box.get_last_child())
+                # Re-query
+                def requery():
+                    devs = get_devices()
+                    serial = devs[0][0] if devs else None
+                    ic = iname = None
+                    if serial and apk_code is not None:
+                        ic, iname = get_installed_version(serial, package) if package else (None, None)
+                    dl = None
+                    if devs:
+                        s, m = devs[0]
+                        dl = f'{m} ({s})' if m else s
+                    GLib.idle_add(_show_device_info, info_box, btn_box, win,
+                                  apk_code, ic, iname, package, dl, bool(devs))
+                threading.Thread(target=requery, daemon=True).start()
+            refresh_btn.connect('clicked', _refresh_devices)
+            no_dev_box.append(refresh_btn)
+            info_box.append(no_dev_box)
 
         if can_install:
             install_btn = Gtk.Button(label='Install')
@@ -574,7 +615,11 @@ def _kill_previous():
 def main():
     _kill_previous()
 
-    paths = os.environ.get('NAUTILUS_SCRIPT_SELECTED_FILE_PATHS', '')
+    # Support both: Nautilus env and direct CLI args
+    if len(sys.argv) > 1:
+        paths = '\n'.join(sys.argv[1:])
+    else:
+        paths = os.environ.get('NAUTILUS_SCRIPT_SELECTED_FILE_PATHS', '')
     files = [p for p in paths.strip().splitlines() if p.lower().endswith('.apk')]
 
     if not files:
