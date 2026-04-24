@@ -244,24 +244,34 @@ def get_installed_version(serial, package):
 
 
 def get_devices():
-    try:
-        r = subprocess.run(
-            ['adb', 'devices', '-l'],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    devices = []
-    for line in r.stdout.strip().splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == 'device':
-            serial = parts[0]
-            model = ''
-            for p in parts[2:]:
-                if p.startswith('model:'):
-                    model = p.split(':', 1)[1]
-            devices.append((serial, model))
-    return devices
+    for attempt in range(2):
+        try:
+            r = subprocess.run(
+                ['adb', 'devices', '-l'],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        devices = []
+        for line in r.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == 'device':
+                serial = parts[0]
+                model = ''
+                for p in parts[2:]:
+                    if p.startswith('model:'):
+                        model = p.split(':', 1)[1]
+                devices.append((serial, model))
+        if devices:
+            return devices
+        if attempt == 0:
+            # Kill conflicting adb servers and restart
+            try: subprocess.run(['pkill', '-f', 'adb'], timeout=3, capture_output=True)
+            except: pass
+            import time; time.sleep(1)
+            try: subprocess.run(['adb', 'start-server'], timeout=5, capture_output=True)
+            except: pass
+    return []
 
 
 def pick_device(devices):
