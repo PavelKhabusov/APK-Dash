@@ -265,8 +265,13 @@ def get_devices():
         if devices:
             return devices
         if attempt == 0:
-            # Kill conflicting adb servers and restart
-            try: subprocess.run(['pkill', '-f', 'adb'], timeout=3, capture_output=True)
+            # Restart adb daemon. NEVER `pkill -f 'adb'` — it matches any
+            # process whose cmdline contains "adb", including a concurrent
+            # `adb devices -l` from another tool (Unity Builder Dash device
+            # manager runs the same query). Killed clients hang in wait()
+            # waiting on a daemon they no longer have, and pile up — dozens
+            # of stuck `adb devices -l` blocking subsequent refreshes.
+            try: subprocess.run(['adb', 'kill-server'], timeout=3, capture_output=True)
             except: pass
             import time; time.sleep(1)
             try: subprocess.run(['adb', 'start-server'], timeout=5, capture_output=True)
