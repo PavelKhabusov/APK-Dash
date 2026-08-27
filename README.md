@@ -11,6 +11,14 @@
 
 A lightweight Nautilus script that turns GNOME Files into an Android developer's best friend. No Android Studio, no terminal, no `aapt` — just right-click and go.
 
+## Quick install
+
+```bash
+sudo pacman -S python-gobject python-pillow android-tools   # Arch
+git clone https://github.com/PavelKhabusov/APK-Dash.git
+cp APK-Dash/"APK Dash" ~/.local/share/nautilus/scripts/ && nautilus -q
+```
+
 ## What it does
 
 - **Version at a glance** — shows `versionName` and `versionCode` right from the context menu
