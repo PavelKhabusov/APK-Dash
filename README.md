@@ -1,15 +1,25 @@
+<div align="center">
+
+<img src="assets/icon.svg" width="96" alt="APK Dash">
+
 # APK Dash
+
+**Right-click any APK in Nautilus** — version info, comparison with what's on your device,
+one-click install. No Android Studio, no terminal, no `aapt`.
+
+![Status](https://img.shields.io/badge/status-active-2ea043)
+![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20GNOME-1f1f1f)
+![License](https://img.shields.io/badge/license-MIT-7ba7d4)
 
 ![Python](https://img.shields.io/badge/Python-3-3776AB?logo=python&logoColor=white)
 ![GTK4](https://img.shields.io/badge/GTK4-Libadwaita-4A86CF?logo=gnome&logoColor=white)
-![ADB](https://img.shields.io/badge/ADB-Android_Tools-3DDC84?logo=android&logoColor=white)
-![Nautilus](https://img.shields.io/badge/Nautilus-Script-E95420?logo=gnome&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-yellow)
-![Arch Linux](https://img.shields.io/badge/Arch_Linux-supported-1793D1?logo=archlinux&logoColor=white)
+![ADB](https://img.shields.io/badge/ADB-Android%20Tools-3DDC84?logo=android&logoColor=white)
+![Nautilus](https://img.shields.io/badge/Nautilus-script-E95420?logo=gnome&logoColor=white)
+![Arch Linux](https://img.shields.io/badge/Arch%20Linux-supported-1793D1?logo=archlinux&logoColor=white)
 
-> Right-click any APK in Nautilus — instantly see version info, compare with what's on your device, and install in one click.
+</div>
 
-A lightweight Nautilus script that turns GNOME Files into an Android developer's best friend. No Android Studio, no terminal, no `aapt` — just right-click and go.
+---
 
 ## Quick install
 
